@@ -1,0 +1,46 @@
+# --- 凭据 / 账号 ---
+.env
+.env.*
+*.env
+
+# --- 业务运行时数据 (含 supply_id/order_id/cargo_id, Ozon 物流业务凭证) ---
+ledger/
+labels/
+pending_summary.json
+
+# --- 业务计划 / 库存 / 决策 / 报表 (PUBLIC repo 不能推) ---
+allocation_*.xlsx
+fbo_plan_*.xlsx
+fbo_plan_*.json
+shipment_overview_*.xlsx
+
+# 通用 Excel 业务表 (含库存/件数/集群)
+*.xlsm
+*.xlsm.xlsx
+设置.xlsx
+*分配仓库*.xls*
+汇总的装箱单*.xls*
+
+# --- retry/probe 临时配置 (可能含账号或运行参数) ---
+probe_*.json
+retry_*.json
+plan_test_*.json
+test_*.json
+
+# --- 缓存 / 编辑器临时 ---
+.box_size_cache.json
+.lark_resolve_cache.json
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# --- macOS / Office 临时 ---
+.DS_Store
+.~*
+~$*
+
+# --- Claude 本地配置 (含 hooks/skills/permissions) ---
+.claude/
