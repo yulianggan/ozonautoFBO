@@ -23,6 +23,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SVC = "http://127.0.0.1:4182"
+RS = "http://127.0.0.1:4181"  # restock decision service (审批后 plans 在这)
 DEFAULT_ACCOUNT = "丝绸生活"
 
 
@@ -49,8 +50,9 @@ def list_supply_orders(account: str, since: str, to: str) -> list[int]:
         body = {
             "filter": {
                 "states": [
-                    "READY_TO_SUPPLY", "DRAFT", "SUPPLIED", "SUPPLIED_PARTIALLY",
-                    "SUPPLY_PROCESSING", "SUPPLY_REJECTED", "CANCELLED",
+                    "READY_TO_SUPPLY", "DATA_FILLING", "DRAFT", "SUPPLIED",
+                    "SUPPLIED_PARTIALLY", "SUPPLY_PROCESSING", "SUPPLY_REJECTED",
+                    "CANCELLED",
                 ],
                 "since": since,
                 "to": to,
@@ -83,7 +85,42 @@ def get_bundle_items(account: str, bundle_id: str) -> list[dict]:
     return r.get("items") or r.get("contents") or []
 
 
-# ------- allocation_xlsx caps -------
+# ------- 4181 approved plans (用户审批后权威 cap) -------
+
+def fetch_approved_plans(account: str) -> dict[str, dict[str, int]]:
+    """从 4181 拉每个 sku 最新 approved/dispatched plan; 返回 {offer_id: {cluster: pieces}}."""
+    enc = urllib.parse.quote(account, safe="")
+    try:
+        with urllib.request.urlopen(f"{RS}/plans?account={enc}&limit=200", timeout=30) as f:
+            lst = json.load(f)
+    except Exception as e:
+        print(f"  ! 4181 /plans 不可达: {e}")
+        return {}
+    by_sku: dict[str, dict] = {}
+    for meta in lst:
+        if meta.get("status") not in ("approved", "dispatched"):
+            continue
+        prev = by_sku.get(meta["sku"])
+        if prev is None or (meta.get("created_at", "") > prev.get("created_at", "")):
+            by_sku[meta["sku"]] = meta
+    caps: dict[str, dict[str, int]] = {}
+    for offer_id, meta in by_sku.items():
+        try:
+            with urllib.request.urlopen(f"{RS}/plans/{meta['plan_id']}", timeout=30) as f:
+                p = json.load(f)
+        except Exception:
+            continue
+        cluster_caps = {}
+        for a in (p.get("allocations") or []):
+            cl = a.get("cluster")
+            if cl:
+                cluster_caps[cl] = int(a.get("pieces") or 0)
+        if cluster_caps:
+            caps[offer_id] = cluster_caps
+    return caps
+
+
+# ------- allocation_xlsx caps (备用源, solver 初稿) -------
 
 def read_allocation_caps(script_dir: Path) -> dict[str, dict[str, int]]:
     caps: dict[str, dict[str, int]] = {}
@@ -141,12 +178,18 @@ def main() -> int:
     ap.add_argument("--account", default=DEFAULT_ACCOUNT)
     ap.add_argument("--since", default="2026-04-22T00:00:00Z")
     ap.add_argument("--to", default="2026-04-26T00:00:00Z")
+    ap.add_argument("--exclude-before", default="",
+                   help="排除 created_date 早于此 ISO 时间的 supply (减老 cancelled 噪音)")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
-    print(f"[1/4] 读 allocation_*.xlsx 取计划 caps")
-    caps = read_allocation_caps(SCRIPT_DIR)
-    print(f"  → {len(caps)} 个 offer_id 有计划")
+    print(f"[1/4] 取计划 caps (优先 4181 审批 plans)")
+    caps = fetch_approved_plans(args.account)
+    cap_source = "4181 approved/dispatched plans"
+    if not caps:
+        caps = read_allocation_caps(SCRIPT_DIR)
+        cap_source = "allocation_*.xlsx (solver 初稿)"
+    print(f"  → 源: {cap_source}, {len(caps)} 个 offer_id 有计划")
     for o, cl in caps.items():
         total = sum(cl.values())
         print(f"    {o}: {len(cl)} 集群, 合计 {total} 件")
@@ -156,21 +199,36 @@ def main() -> int:
     print(f"  → {len(wh_map)} 个仓库")
 
     # 反向 stem→cluster 用于 fuzzy fallback (老仓如 НОВОСИБИРСК_РФЦ_НОВЫЙ → 找含 НОВОСИБИРСК 的)
-    stem_to_cluster: dict[str, str] = {}
+    # stem 去重: 同 stem 只接受映射到唯一 cluster, 多 cluster 视为歧义不用
+    stem_buckets: dict[str, set[str]] = {}
     for wh, cl in wh_map.items():
-        # 取 wh 第一个 _ 前的 stem (НОВОСИБИРСК_РФЦ → НОВОСИБИРСК)
         stem = wh.split("_")[0]
-        stem_to_cluster.setdefault(stem, cl)
+        stem_buckets.setdefault(stem, set()).add(cl)
+    stem_to_cluster: dict[str, str] = {
+        stem: list(clusters)[0]
+        for stem, clusters in stem_buckets.items()
+        if len(clusters) == 1
+    }
+
+    import difflib
 
     def storage_to_cluster(wh_name: str) -> str:
         if not wh_name:
             return "?"
         if wh_name in wh_map:
             return wh_map[wh_name]
-        # fuzzy: 查 stem (老仓 _НОВЫЙ 后缀等)
+        # 1) startswith 匹配 (老仓 _НОВЫЙ 后缀等)
+        for known_wh, cl in wh_map.items():
+            if wh_name.startswith(known_wh) or known_wh.startswith(wh_name):
+                return cl
+        # 2) stem 唯一映射
         stem = wh_name.split("_")[0]
         if stem in stem_to_cluster:
             return stem_to_cluster[stem]
+        # 3) difflib 取最相近 (>=0.85 才信)
+        match = difflib.get_close_matches(wh_name, list(wh_map.keys()), n=1, cutoff=0.85)
+        if match:
+            return wh_map[match[0]]
         return f"?({wh_name})"
 
     print(f"\n[2/4] 拉 Ozon supply orders ({args.since} ~ {args.to})")
@@ -179,6 +237,10 @@ def main() -> int:
 
     print(f"\n[3/4] 拉每个 order 的详情 + bundle items")
     orders = get_orders(args.account, ids)
+    if args.exclude_before:
+        before = len(orders)
+        orders = [o for o in orders if (o.get("created_date") or "") >= args.exclude_before]
+        print(f"  --exclude-before {args.exclude_before}: 排除 {before-len(orders)} 个早期 supply, 保留 {len(orders)}")
     rows = []  # 每行: (order_id, supply_id, state, cluster, offer_id, qty, is_cancelled)
     for o in orders:
         order_id = o.get("order_id")
@@ -265,18 +327,31 @@ def main() -> int:
     fill_done = PatternFill("solid", fgColor="D6F0C8")
     fill_cancel = PatternFill("solid", fgColor="F0D6D6")
 
+    # 计算每 offer 的全 SKU 总量 (改派支持: cap 总 = sum cluster caps; active 总 = 所有 cluster active)
+    offer_cap_total: dict[str, int] = {oid: sum(cl.values()) for oid, cl in caps.items()}
+    offer_active_total: dict[str, int] = {}
+    for (cluster, offer_id), a in agg.items():
+        offer_active_total[offer_id] = offer_active_total.get(offer_id, 0) + a["shipped_active"]
+
     # 排序: 集群按字典序, offer_id 内按字典序
     for (cluster, offer_id), a in sorted(agg.items()):
         diff = a["planned"] - a["shipped_active"]
-        if a["shipped_cancelled"] > 0 and a["shipped_active"] == 0:
+        cap_t = offer_cap_total.get(offer_id, 0)
+        act_t = offer_active_total.get(offer_id, 0)
+        # 改派抵扣: 该 offer 全 SKU 已发齐 (含跨集群), 即使本 cluster 缺也算完成
+        offer_fully_done = cap_t > 0 and act_t >= cap_t
+        if a["shipped_cancelled"] > 0 and a["shipped_active"] == 0 and not offer_fully_done:
             status = "全部取消"
             row_fill = fill_cancel
         elif diff <= 0 and a["planned"] > 0:
             status = "已完成"
             row_fill = fill_done
+        elif offer_fully_done and a["planned"] > 0 and diff > 0:
+            status = "改派抵扣已完成"
+            row_fill = fill_done
         elif a["planned"] == 0 and a["shipped_active"] > 0:
-            status = "无计划-意外发货"
-            row_fill = fill_warn
+            status = "无计划-意外发货 (改派目标)" if offer_fully_done else "无计划-意外发货"
+            row_fill = fill_done if offer_fully_done else fill_warn
         elif diff > 0:
             status = "缺 {} 件".format(diff)
             row_fill = fill_warn

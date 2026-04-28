@@ -237,6 +237,42 @@ def fetch_plans_by_ids(service: str, plan_ids: list[str]) -> list[dict]:
     return out
 
 
+def fetch_approved_caps(service: str, account: str, offer_ids: list[str]) -> dict[str, dict[str, int]]:
+    """从 4181 拉每个 offer_id 最新 approved/dispatched plan, 返回 {offer_id: {cluster: pieces}}.
+
+    用于 cfg 模式 alloc-check (替代 allocation_xlsx 的 solver 数据);
+    审批件数才是权威 cap, allocation_xlsx 是 HITL 前的初稿.
+    """
+    from urllib.parse import quote as _q
+    try:
+        lst = _rs_get(service, f"/plans?account={_q(account, safe='')}&limit=200")
+    except Exception:
+        return {}
+    by_sku: dict[str, dict] = {}
+    for meta in lst:
+        if meta.get("sku") not in offer_ids:
+            continue
+        if meta.get("status") not in ("approved", "dispatched"):
+            continue
+        prev = by_sku.get(meta["sku"])
+        if prev is None or (meta.get("created_at", "") > prev.get("created_at", "")):
+            by_sku[meta["sku"]] = meta
+    caps: dict[str, dict[str, int]] = {}
+    for offer_id, meta in by_sku.items():
+        try:
+            p = _rs_get(service, f"/plans/{meta['plan_id']}")
+        except Exception:
+            continue
+        cluster_caps = {}
+        for a in (p.get("allocations") or []):
+            cl = a.get("cluster")
+            if cl:
+                cluster_caps[cl] = int(a.get("pieces") or 0)
+        if cluster_caps:
+            caps[offer_id] = cluster_caps
+    return caps
+
+
 def fetch_plans_by_batch(service: str, account: str, batch_id: str) -> list[dict]:
     """按 batch_id 取所有 plan (列表 view 不含 batch_id, 故需逐个拉详情筛选)."""
     from urllib.parse import quote as _q
@@ -635,6 +671,70 @@ def split_into_cargoes(barcode: str, qty: int, box_size: int) -> list[dict]:
     return out
 
 
+def safe_cancel_supply(cli: FBOClient, order_id: int, label: str = "") -> bool:
+    """Cancel 但先把 timeslot 推到 UTC +82h (>80h 莫斯科阈值, 防平台罚款).
+
+    Ozon /timeslot/update 要 google.protobuf.Timestamp 格式 (ISO + Z 后缀, UTC).
+    返回 True 表示 cancel 成功; False 失败 (但已尝试).
+    """
+    from datetime import datetime, timezone, timedelta
+    moscow = timezone(timedelta(hours=3))
+    target_utc = datetime.now(timezone.utc) + timedelta(hours=82)
+    target_utc = target_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    new_from = target_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_to = (target_utc + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 1) 查当前 timeslot
+    needs_shift = True
+    try:
+        cur = cli.post("/supply-order/timeslot/get", {"supply_order_id": order_id})
+        cur_from = (cur.get("timeslot") or {}).get("from") or cur.get("from", "")
+        if cur_from:
+            cur_dt = datetime.fromisoformat(cur_from.replace("Z", "+00:00"))
+            if cur_dt.tzinfo is None:
+                cur_dt = cur_dt.replace(tzinfo=moscow)
+            now_moscow = datetime.now(moscow)
+            hrs_ahead = (cur_dt - now_moscow).total_seconds() / 3600
+            if hrs_ahead >= 80:
+                needs_shift = False
+                print(f"  {label or order_id}: 当前 timeslot {cur_from} (≥80h, 直接 cancel)")
+    except Exception as e:
+        print(f"  ! timeslot/get 失败: {e}; 仍尝试 shift")
+
+    # 2) 若需要, shift timeslot
+    if needs_shift:
+        print(f"  {label or order_id}: shift timeslot → {new_from} ~ {new_to} (+82h)")
+        try:
+            up = cli.post("/supply-order/timeslot/update", {
+                "supply_order_id": order_id,
+                "timeslot": {"from": new_from, "to": new_to},
+            })
+            op = up.get("operation_id")
+            if op:
+                poll(
+                    fetch=lambda: cli.post("/supply-order/timeslot/status", {"operation_id": op}),
+                    done=lambda b: any(t in str(b.get("status","")).upper() for t in ("SUCCESS","FAILED","ERROR")),
+                    interval=2.0, timeout=60.0, label=f"timeslot shift {order_id}",
+                )
+        except Exception as e:
+            print(f"  ! timeslot shift 失败: {e}; 仍尝试 cancel (可能扣分)")
+
+    # 3) cancel
+    try:
+        cancel = cli.post("/supply-order/cancel", {"order_id": order_id})
+        op = cancel.get("operation_id")
+        if op:
+            poll(
+                fetch=lambda: cli.post("/supply-order/cancel/status", {"operation_id": op}),
+                done=lambda b: any(t in str(b.get("status","")).upper() for t in ("SUCCESS","FAILED","ERROR")),
+                interval=2.0, timeout=60.0, label=f"cancel {order_id}",
+            )
+        return True
+    except Exception as e:
+        print(f"  ! cancel 失败: {e}")
+        return False
+
+
 def fetch_supply_actual_items(cli: FBOClient, order_detail: dict) -> dict[int, int]:
     """用 /supply-order/bundle 查 supply 实际含的 items (Ozon 矩阵可能悄悄过滤某些 SKU).
     返 {sku: quantity}.
@@ -850,8 +950,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-fill", action="store_true",
                    help="建完 supply_order 就停, 不申报装箱/不拉标签")
     p.add_argument("--skip-alloc-check", action="store_true",
-                   help="跳过 allocation_xlsx vs cfg.matrix 件数 sanity check (谨慎用)")
-    p.add_argument("--days-from", type=int, default=3)
+                   help="跳过 4181 plans/allocation vs cfg.matrix 件数 sanity check (谨慎用)")
+    p.add_argument("--min-box-fill-rate", type=float, default=0.5,
+                   help="Ozon 实接 < box_size × 此比例 自动撤 (默认 0.5, 即 < box/2 即撤)")
+    p.add_argument("--days-from", type=int, default=4,
+                   help="timeslot 起始天数 (默认 4, ≥80h 莫斯科, 防 cancel 罚款)")
     p.add_argument("--days-to", type=int, default=28)
     return p.parse_args()
 
@@ -903,23 +1006,47 @@ def main() -> int:
     if args.box_size <= 0:
         print(f"[ERROR] --box-size 必须 > 0"); return 2
 
-    # ---- allocation cap 校验 (防上游 raw 需求绕过 allocation 限制泄漏到 supply) ----
+    # ---- cfg 整箱规则 sanity (用户规则: 件数若有残箱, 残必须 ≥ box_size/2) ----
     if not args.skip_alloc_check:
-        caps = _read_allocation_caps(SCRIPT_DIR)
+        bad_box: list[str] = []
+        for cl, sku_qtys in (cfg.get("matrix") or {}).items():
+            for offer_id, qty in sku_qtys.items():
+                rem = int(qty) % args.box_size
+                if rem > 0 and rem < args.box_size // 2:
+                    bad_box.append(
+                        f"{cl} / {offer_id}: {qty} 件 = "
+                        f"{int(qty)//args.box_size} 整箱 + 残 {rem} < {args.box_size//2}"
+                    )
+        if bad_box:
+            print(f"[ERROR] 件数残箱违规 ({len(bad_box)} 条):", file=sys.stderr)
+            for v in bad_box:
+                print(f"  - {v}", file=sys.stderr)
+            print("[hint] 残箱件数 < box_size/2 不能发 (实际仓打不到半箱); list_pending --from-approved 已自动 floor.", file=sys.stderr)
+            print("       手工撤改件数, 或加 --skip-alloc-check 强制覆盖.", file=sys.stderr)
+            return 2
+
+    # ---- alloc cap 校验 (防上游 raw 需求绕过审批 cap) ----
+    # 优先级: 4181 approved/dispatched plans (审批后权威) > allocation_*.xlsx (solver 初稿) > 跳过
+    if not args.skip_alloc_check:
+        offers_in_cfg = sorted({o for r in cfg.get("matrix", {}).values() for o in r.keys()})
+        caps = fetch_approved_caps(args.restock_service, args.account, offers_in_cfg)
+        cap_source = "4181 approved/dispatched plans"
+        if not caps:
+            caps = _read_allocation_caps(SCRIPT_DIR)
+            cap_source = "allocation_*.xlsx (solver 初稿; 4181 无审批 plan)"
         if caps:
-            offers_in_cfg = {o for r in cfg.get("matrix", {}).values() for o in r.keys()}
             covered = sum(1 for o in offers_in_cfg if o in caps)
-            print(f"[alloc] 校验 cfg.matrix 不超 allocation 合计件 (已知 {covered}/{len(offers_in_cfg)} offer)")
+            print(f"[alloc] 校验 cfg.matrix 不超 cap (源: {cap_source}; 已知 {covered}/{len(offers_in_cfg)} offer)")
             violations = assert_cfg_within_alloc(cfg, caps)
             if violations:
-                print(f"[ERROR] allocation cap 违规 ({len(violations)} 条):", file=sys.stderr)
+                print(f"[ERROR] alloc cap 违规 ({len(violations)} 条):", file=sys.stderr)
                 for v in violations:
                     print(f"  - {v}", file=sys.stderr)
-                print("[hint] 本次 cfg 件数超 allocation 决策的 cap, 真发可能造成超额建单 (见 supply 100580300 教训).", file=sys.stderr)
+                print("[hint] 本次 cfg 件数超审批 cap, 真发会造成超额建单 (见 supply 100580300 教训).", file=sys.stderr)
                 print("       如果确认要发, 加 --skip-alloc-check 强制覆盖.", file=sys.stderr)
                 return 2
         else:
-            print(f"[alloc] 未找到 allocation_*.xlsx, 跳过 cap 校验")
+            print(f"[alloc] 未找到 4181 plans 或 allocation_*.xlsx, 跳过 cap 校验")
 
     cli = FBOClient(args.fbo_service, args.account)
 
@@ -1124,6 +1251,34 @@ def main() -> int:
             for oid, q in matrix[kw].items():
                 qty_by_sku[skus[oid]] = qty_by_sku.get(skus[oid], 0) + q
 
+        # ----- MIN_BOX_FILL_RATE 校验: Ozon 实接 < box_size/2 自动撤 -----
+        # 防 51件/59件 这种"小空箱" supply 占配额 (Bug A)
+        min_fill = max(1, int(args.box_size * args.min_box_fill_rate))
+        actual_items = fetch_supply_actual_items(cli, od)
+        actual_total = sum(actual_items.values()) if actual_items else 0
+        if actual_total > 0 and actual_total < min_fill:
+            supply_id_for_log = (od.get("supplies") or [{}])[0].get("supply_id","")
+            print(
+                f"  ! order {order_id} (supply {supply_id_for_log}) Ozon 实接 {actual_total} 件 "
+                f"< 阈值 {min_fill} (box {args.box_size}×{args.min_box_fill_rate}); 自动撤 (timeslot shift +82h 防罚)"
+            )
+            try:
+                safe_cancel_supply(cli, order_id, label=f"auto-cancel {order_id}")
+                # ledger: 记 skipped (跟矩阵拒一样, 后续可重发)
+                for kw in row["cluster_kws"]:
+                    for oid, q in matrix[kw].items():
+                        ledger["skipped"].append({
+                            "cluster": macros[kw]["name"], "offer_id": oid,
+                            "sku": skus[oid], "quantity": q,
+                            "reason_code": "BELOW_MIN_BOX_FILL",
+                            "reason": f"Ozon 实接 {actual_total} 件 < {min_fill} (auto-cancelled order {order_id})",
+                            "related_order_id": order_id,
+                            "timestamp": _now_iso(),
+                        })
+                continue  # 不进 fill, 不进 shipped
+            except Exception as e:
+                print(f"  ! 自动撤失败: {e}; 仍继续 fill (留给手工处理)")
+
         fill_r = None
         note = ""
         if not args.skip_fill:
@@ -1195,6 +1350,15 @@ def main() -> int:
                         break
 
         # 输出 rows 按 (集群×SKU) 独立行 — 链路=MULTI_CLUSTER 时 1 个 order 多集群, 每集群单独起
+        # actual_by_sku: Ozon 实际接受 (用来覆盖 declared, 防止 xlsx 写虚假行)
+        _actual_by_sku = (fill_r or {}).get("actual_qty_by_sku") or {}
+
+        def _eff_q(declared: int, sku: int) -> int:
+            """if Ozon trimmed (single-cluster mode), use actual qty; otherwise declared."""
+            if row["mode"] != "MULTI_CLUSTER" and _actual_by_sku and sku in _actual_by_sku:
+                return min(declared, int(_actual_by_sku[sku]))
+            return declared
+
         if row["mode"] == "MULTI_CLUSTER":
             # 按 (cluster, sku) 切箱, 全 order 共享一个 PDF
             global_cargo_idx = 0
@@ -1227,20 +1391,22 @@ def main() -> int:
                             "该箱件数": in_box,
                             "总件数": q,
                             "总箱数": box_n,
-                            "单箱装箱率": args.box_size,
+                            "单箱装箱率": in_box,  # 真实该箱件数, 不是 design rate
                             "时段": f"{(od.get('timeslot',{}).get('timeslot') or {}).get('from','')} ~ {(od.get('timeslot',{}).get('timeslot') or {}).get('to','')}",
                             "箱唛 PDF 路径": (fill_r or {}).get("pdf_path",""),
                             "备注/错误": note if global_cargo_idx == 0 else "",
                         })
                         global_cargo_idx += 1
         else:
-            # single-cluster: cluster_kws 只有 1 个
+            # single-cluster: cluster_kws 只有 1 个; q 用 actual cap (Ozon 实接 < declared 时, 不写虚假满箱行)
             kw = row["cluster_kws"][0]
             global_cargo_idx = 0
             cargo_ids = (fill_r or {}).get("cargo_ids") or []
-            for oid, q in matrix[kw].items():
-                if q == 0: continue
+            for oid, q_decl in matrix[kw].items():
+                if q_decl == 0: continue
                 sku = skus[oid]
+                q = _eff_q(q_decl, sku)
+                if q == 0: continue
                 box_n = math.ceil(q / args.box_size)
                 remain = q
                 for bi in range(box_n):
@@ -1265,7 +1431,7 @@ def main() -> int:
                         "该箱件数": in_box,
                         "总件数": q,
                         "总箱数": box_n,
-                        "单箱装箱率": args.box_size,
+                        "单箱装箱率": in_box,  # 真实该箱件数, 不是 design rate
                         "时段": f"{(od.get('timeslot',{}).get('timeslot') or {}).get('from','')} ~ {(od.get('timeslot',{}).get('timeslot') or {}).get('to','')}",
                         "箱唛 PDF 路径": (fill_r or {}).get("pdf_path",""),
                         "备注/错误": note if global_cargo_idx == 0 else "",
